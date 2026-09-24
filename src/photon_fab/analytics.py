@@ -8,6 +8,12 @@ from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 
+# 端点判据的相对容差。仪器按“峰值的 80%”上报的采样点经过浮点乘法后
+# 可能落在阈值下方一个 ULP（例如 0.93*0.8 = 0.7440000000000001 > 0.744），
+# 用容差把数学上恰好等于阈值的端点包含进合格带宽。
+_BAND_REL_TOL = 1e-12
+
+
 @dataclass(frozen=True)
 class SpectrumSummary:
     count: int
@@ -19,22 +25,46 @@ class SpectrumSummary:
 
 
 def _pairs(wavelengths: Sequence[float], response: Sequence[float]) -> list[tuple[float, float]]:
-    if len(wavelengths) != len(response) or len(wavelengths) < 3:
+    pairs: list[tuple[float, float]] = []
+    seen_wavelengths: set[float] = set()
+    for w, r in zip(wavelengths, response):
+        try:
+            wf, rf = float(w), float(r)
+        except (TypeError, ValueError):
+            raise ValueError("wavelength and response must be numeric")
+        # 有限性必须在排序之前校验：NaN 会让 sorted/max 的比较结果不可解释。
+        if not math.isfinite(wf) or not math.isfinite(rf):
+            raise ValueError("wavelength and response must be finite")
+        if wf in seen_wavelengths:
+            raise ValueError(f"duplicate wavelength: {wf:g} nm")
+        seen_wavelengths.add(wf)
+        pairs.append((wf, rf))
+    if len(wavelengths) != len(response):
+        raise ValueError("wavelength and response sequences must have the same length")
+    if len(pairs) < 3:
         raise ValueError("at least three wavelength/response pairs are required")
-    pairs = sorted((float(w), float(r)) for w, r in zip(wavelengths, response))
-    if any(not math.isfinite(w) or not math.isfinite(r) for w, r in pairs):
-        raise ValueError("measurements must be finite")
+    # 始终按波长重排，保证峰值、带宽和噪声统计与上报顺序无关。
+    pairs.sort(key=lambda p: p[0])
     return pairs
 
 
 def summarize_spectrum(wavelengths: Sequence[float], response: Sequence[float], threshold: float = 0.8) -> SpectrumSummary:
     pairs = _pairs(wavelengths, response)
+    threshold = float(threshold)
+    if not math.isfinite(threshold) or not 0.0 < threshold <= 1.0:
+        raise ValueError("threshold must be within (0, 1]")
+    # 对已按波长排序的序列取 max，等高峰值确定性地落在最短波长处。
     peak_w, peak_r = max(pairs, key=lambda p: p[1])
     values = [r for _, r in pairs]
     mean = statistics.fmean(values)
     noise = math.sqrt(statistics.fmean((r - mean) ** 2 for r in values))
-    band = [w for w, r in pairs if r >= peak_r * threshold]
-    return SpectrumSummary(len(pairs), peak_w, peak_r, mean, noise, (min(band), max(band)))
+    cutoff = peak_r * threshold
+    tolerance = abs(cutoff) * _BAND_REL_TOL
+    band = [w for w, r in pairs if r >= cutoff - tolerance]
+    # 退化输入下（例如全负响应）兜底为峰值点，保证带端始终有定义。
+    if not band:
+        band = [peak_w]
+    return SpectrumSummary(len(pairs), peak_w, peak_r, mean, noise, (band[0], band[-1]))
 
 
 def confidence_interval(values: Iterable[float], confidence: float = 0.95) -> tuple[float, float]:

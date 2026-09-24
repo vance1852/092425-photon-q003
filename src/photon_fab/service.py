@@ -2,12 +2,25 @@
 
 from __future__ import annotations
 
+import math
 import uuid
 from typing import Sequence
 
 from .analytics import confidence_interval, summarize_spectrum, yield_rate
 from .auth import Auth
 from .storage import connect, event, transaction, utcnow
+
+
+def _finite(value: object, name: str, *, nonnegative: bool = False) -> float:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be numeric") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be finite")
+    if nonnegative and number < 0.0:
+        raise ValueError(f"{name} must not be negative")
+    return number
 
 
 class PhotonService:
@@ -23,7 +36,15 @@ class PhotonService:
 
     def create_lot(self, token: str, lot_id: str, product: str, process_rev: str, wafer_count: int) -> dict:
         actor = self.auth.require(token, "submit")
-        if wafer_count <= 0 or not lot_id.strip() or not process_rev.strip():
+        try:
+            wafer_count = int(wafer_count)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("wafer_count must be an integer") from exc
+        if not isinstance(lot_id, str) or not lot_id.strip():
+            raise ValueError("lot_id is required")
+        if not isinstance(product, str) or not product.strip():
+            raise ValueError("product is required")
+        if wafer_count <= 0 or not isinstance(process_rev, str) or not process_rev.strip():
             raise ValueError("lot fields are invalid")
         now = utcnow()
         with transaction(self.db):
@@ -40,17 +61,30 @@ class PhotonService:
 
     def add_measurement(self, token: str, lot_id: str, wavelength_nm: float, response: float, noise: float, instrument: str) -> dict:
         actor = self.auth.require(token, "measure")
+        wavelength = _finite(wavelength_nm, "wavelength_nm")
+        if wavelength <= 0.0:
+            raise ValueError("wavelength_nm must be positive")
+        measured_response = _finite(response, "response")
+        noise_floor = _finite(noise, "noise", nonnegative=True)
+        if not isinstance(instrument, str) or not instrument.strip():
+            raise ValueError("instrument is required")
         measurement_id = uuid.uuid4().hex
         with transaction(self.db):
             if not self.db.execute("SELECT 1 FROM chip_lots WHERE lot_id=?", (lot_id,)).fetchone():
                 raise KeyError(lot_id)
-            self.db.execute("INSERT INTO measurements VALUES(?,?,?,?,?,?,?,?)", (measurement_id, lot_id, float(wavelength_nm), float(response), float(noise), instrument, actor.user_id, utcnow()))
-            event(self.db, lot_id, "measurement", actor.user_id, {"measurement_id": measurement_id, "wavelength_nm": wavelength_nm})
+            if self.db.execute(
+                "SELECT 1 FROM measurements WHERE lot_id=? AND wavelength_nm=?", (lot_id, wavelength)
+            ).fetchone():
+                raise ValueError(f"measurement at {wavelength:g} nm already exists for this lot")
+            self.db.execute("INSERT INTO measurements VALUES(?,?,?,?,?,?,?,?)", (measurement_id, lot_id, wavelength, measured_response, noise_floor, instrument, actor.user_id, utcnow()))
+            event(self.db, lot_id, "measurement", actor.user_id, {"measurement_id": measurement_id, "wavelength_nm": wavelength})
         return {"measurement_id": measurement_id, "lot_id": lot_id}
 
     def analyze(self, token: str, lot_id: str) -> dict:
         self.auth.require(token, "analyze")
         rows = self.db.execute("SELECT wavelength_nm,response FROM measurements WHERE lot_id=? ORDER BY wavelength_nm", (lot_id,)).fetchall()
+        if not self.db.execute("SELECT 1 FROM chip_lots WHERE lot_id=?", (lot_id,)).fetchone():
+            raise KeyError(lot_id)
         if len(rows) < 3:
             raise ValueError("three measurements are required")
         summary = summarize_spectrum([r[0] for r in rows], [r[1] for r in rows])

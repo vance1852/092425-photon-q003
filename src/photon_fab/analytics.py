@@ -18,22 +18,53 @@ class SpectrumSummary:
     pass_band_nm: tuple[float, float]
 
 
+# 端点恰好落在阈值上时，允许该量级的浮点舍入误差，避免 0.93*0.8=0.7440000000000001
+# 这类误差把数学上恰好在阈值上的采样点排除掉。
+_BAND_REL_TOL = 1e-12
+_BAND_ABS_TOL = 1e-12
+
+
 def _pairs(wavelengths: Sequence[float], response: Sequence[float]) -> list[tuple[float, float]]:
-    if len(wavelengths) != len(response) or len(wavelengths) < 3:
+    if len(wavelengths) != len(response):
+        raise ValueError("wavelengths and response must have equal length")
+    if len(wavelengths) < 3:
         raise ValueError("at least three wavelength/response pairs are required")
-    pairs = sorted((float(w), float(r)) for w, r in zip(wavelengths, response))
-    if any(not math.isfinite(w) or not math.isfinite(r) for w, r in pairs):
-        raise ValueError("measurements must be finite")
+    try:
+        pairs = [(float(w), float(r)) for w, r in zip(wavelengths, response)]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("wavelength and response must be numeric") from exc
+    seen: set[float] = set()
+    for w, r in pairs:
+        if not math.isfinite(w) or not math.isfinite(r):
+            raise ValueError("measurements must be finite")
+        if w <= 0:
+            raise ValueError("wavelength must be positive")
+        if w in seen:
+            raise ValueError(f"duplicate wavelength measurement: {w:g} nm")
+        seen.add(w)
+    # 始终按波长重排，使峰值、带宽、噪声等统计结果与采样上报顺序无关。
+    pairs.sort(key=lambda p: p[0])
     return pairs
 
 
 def summarize_spectrum(wavelengths: Sequence[float], response: Sequence[float], threshold: float = 0.8) -> SpectrumSummary:
+    try:
+        threshold = float(threshold)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("threshold must be numeric") from exc
+    if not 0.0 < threshold <= 1.0:
+        raise ValueError("threshold must lie within (0, 1]")
     pairs = _pairs(wavelengths, response)
     peak_w, peak_r = max(pairs, key=lambda p: p[1])
     values = [r for _, r in pairs]
     mean = statistics.fmean(values)
     noise = math.sqrt(statistics.fmean((r - mean) ** 2 for r in values))
-    band = [w for w, r in pairs if r >= peak_r * threshold]
+    cutoff = peak_r * threshold
+    # 端点包含规则：响应达到或超过阈值（含浮点容差）的采样点都属于合格带宽，
+    # 阈值恰好等于峰值 80% 时不得排除边界采样点。
+    band = [w for w, r in pairs if r >= cutoff or math.isclose(r, cutoff, rel_tol=_BAND_REL_TOL, abs_tol=_BAND_ABS_TOL)]
+    if not band:
+        raise ValueError("no samples fall within the pass band")
     return SpectrumSummary(len(pairs), peak_w, peak_r, mean, noise, (min(band), max(band)))
 
 
